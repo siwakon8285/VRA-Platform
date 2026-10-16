@@ -1,0 +1,141 @@
+name: D-04 Hosted Venue Preflight
+run-name: VENUE_PREFLIGHT_ONLY
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  venue-preflight:
+    name: VENUE_PREFLIGHT_ONLY
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Read-only hosted venue inspection
+        shell: bash
+        timeout-minutes: 1
+        env:
+          VENUE_ENVIRONMENT: ${{ runner.environment }}
+          VENUE_OS: ${{ runner.os }}
+          VENUE_ARCH: ${{ runner.arch }}
+          VENUE_REPOSITORY: ${{ github.repository }}
+          VENUE_EVENT: ${{ github.event_name }}
+          VENUE_REF: ${{ github.ref }}
+          VENUE_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VENUE_RUN_ID: ${{ github.run_id }}
+          VENUE_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          echo 'VENUE_PREFLIGHT_ONLY: observations do not establish D-04 security guarantees'
+          if [[ ! -x /usr/bin/python3 ]]; then
+            echo 'VENUE_PREFLIGHT_ONLY: required environment NOT VERIFIED; Python unavailable'
+            exit 1
+          fi
+          /usr/bin/python3 -I -S -B - <<'PY'
+          import http.client
+          import json
+          import os
+          import re
+          import shlex
+          import socket
+          import stat
+          import sys
+
+          properties = (
+              "workflow_context", "runner_context", "non_root_process", "host_os_arch",
+              "kernel_metadata", "ubuntu_release", "docker_socket_metadata", "docker_version_response",
+          )
+          report = {
+              "scope": "VENUE_PREFLIGHT_ONLY",
+              "required_environment": "NOT VERIFIED",
+              "checks": dict.fromkeys(properties, "NOT VERIFIED"),
+              "observations": {},
+              "security_guarantees": dict.fromkeys((
+                  "D04_security_boundary", "privileged_mutation_authority",
+                  "continuous_mutator_exclusion", "independent_vm_disposal",
+              ), "NOT VERIFIED"),
+          }
+
+          def verify(name, condition):
+              report["checks"][name] = "VERIFIED" if condition else "NOT VERIFIED"
+              if not condition:
+                  raise ValueError(name)
+
+          def public_text(value):
+              if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9._+~-]{1,128}", value):
+                  raise ValueError("invalid public metadata")
+              return value
+
+          try:
+              env = os.environ.get
+              run_id, attempt = env("VENUE_RUN_ID", ""), env("VENUE_RUN_ATTEMPT", "")
+              default_branch = env("VENUE_DEFAULT_BRANCH", "")
+              verify("workflow_context",
+                     env("VENUE_EVENT") == "workflow_dispatch"
+                     and env("VENUE_REPOSITORY") == "siwakon8285/VRA-Platform"
+                     and bool(default_branch)
+                     and env("VENUE_REF") == "refs/heads/" + default_branch
+                     and bool(re.fullmatch(r"[0-9]{1,30}", run_id))
+                     and bool(re.fullmatch(r"[0-9]{1,30}", attempt)))
+              runner = (env("VENUE_ENVIRONMENT"), env("VENUE_OS"), env("VENUE_ARCH"))
+              verify("runner_context", runner == ("github-hosted", "Linux", "X64"))
+              report["observations"]["runner"] = {
+                  "environment": runner[0], "os": runner[1], "arch": runner[2],
+                  "repository": "siwakon8285/VRA-Platform", "run_id": run_id, "run_attempt": attempt,
+              }
+              verify("non_root_process", os.geteuid() != 0)
+              report["observations"]["process_euid"] = os.geteuid()
+              host = os.uname()
+              verify("host_os_arch", (host.sysname, host.machine) == ("Linux", "x86_64"))
+              kernel = public_text(host.release)
+              verify("kernel_metadata", True)
+              report["observations"]["host"] = {
+                  "os": host.sysname, "arch": host.machine, "kernel": kernel,
+              }
+              with open("/etc/os-release", encoding="utf-8") as source:
+                  raw_release = source.read(8193)
+              if len(raw_release) > 8192:
+                  raise ValueError("OS metadata exceeds bound")
+              release = {}
+              for line in raw_release.splitlines():
+                  key, separator, value = line.partition("=")
+                  if separator and key in ("ID", "VERSION_ID"):
+                      values = shlex.split(value)
+                      if key in release or len(values) != 1:
+                          raise ValueError("ambiguous OS metadata")
+                      release[key] = values[0]
+              verify("ubuntu_release", release == {"ID": "ubuntu", "VERSION_ID": "24.04"})
+              report["observations"]["distribution"] = release
+              endpoint = "/var/run/docker.sock"
+              metadata = os.stat(endpoint)
+              verify("docker_socket_metadata", stat.S_ISSOCK(metadata.st_mode))
+              report["observations"]["docker_socket"] = {
+                  "path": endpoint, "type": "socket", "uid": metadata.st_uid,
+                  "gid": metadata.st_gid, "mode": format(stat.S_IMODE(metadata.st_mode), "04o"),
+              }
+              # Fixed Unix endpoint and GET only; no Docker config, context, credentials or mutations.
+              with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+                  channel.settimeout(5)
+                  channel.connect(endpoint)
+                  channel.sendall(b"GET /version HTTP/1.0\r\nHost: localhost\r\n\r\n")
+                  response = http.client.HTTPResponse(channel)
+                  response.begin()
+                  body = response.read(65537)
+                  if response.status != 200 or len(body) > 65536:
+                      raise ValueError("Docker version response unavailable or exceeds bound")
+                  version = json.loads(body)
+              fields = {key: public_text(version[key]) for key in ("Version", "ApiVersion", "Os", "Arch")}
+              if "MinAPIVersion" in version:
+                  fields["MinAPIVersion"] = public_text(version["MinAPIVersion"])
+              verify("docker_version_response",
+                     (fields["Os"], fields["Arch"]) == ("linux", "amd64")
+                     and bool(re.fullmatch(r"[0-9]{1,4}\.[0-9]{1,4}", fields["ApiVersion"])))
+              report["observations"]["docker_server_reported"] = fields
+              report["required_environment"] = "VERIFIED"
+          except Exception as failure:
+              # Exception messages and raw daemon responses may contain sensitive data.
+              report["inspection_error_type"] = type(failure).__name__
+          print(json.dumps(report, indent=2, sort_keys=True))
+          sys.exit(0 if report["required_environment"] == "VERIFIED" else 1)
+          PY
